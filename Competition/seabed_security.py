@@ -51,6 +51,82 @@ class Drone(NamedTuple):
     scans: List[int]
 
 
+class Palantir:
+    def __init__(self, fish_details, monster_fish_ids):
+        self.visible_fish = []
+        self.radar_blips = []
+        self.my_drones = []
+        self.foe_drones = []
+        self.monster_fish_ids = monster_fish_ids
+        self.fish_entries = {}
+        for fish_id in fish_details:
+            self.fish_entries[fish_id] = {
+                "details": fish_details[fish_id],
+                "bounding_box": {"p0": (0, 0), "p1": (9999, 9999)},
+            }
+
+    def update(self, visible_fish, radar_blips, my_drones, foe_drones):
+        self.visible_fish = visible_fish
+        self.radar_blips = radar_blips
+        self.my_drones = my_drones
+        self.foe_drones = foe_drones
+
+        # Update exact location accordinig to visible data
+        for fish in visible_fish:
+            self.fish_entries[fish.fish_id]["exact_location"] = {
+                "pos": fish.pos,
+                "speed": fish.speed,
+            }
+
+        # Combine radar blips from multiple drones
+        # Each combined radar blips entry stores the position of the drone that took it
+        # and the direction of the blip. This is stored for each drones
+        comb_radar_blips = {}
+        for drone in self.my_drones:
+            if drone.drone_id not in radar_blips:
+                continue
+            for rb in radar_blips[drone.drone_id]:
+                if rb.fish_id not in comb_radar_blips:
+                    comb_radar_blips[rb.fish_id] = []
+                comb_radar_blips[rb.fish_id].append(
+                    {"drone_pos": drone.pos, "dir": rb.dir}
+                )
+
+        # Update bounding boxes based on combined radar blips
+        for fish_id, sightings in comb_radar_blips.items():
+            p0x, p0y = (0, 0)
+            p1x, p1y = (9999, 9999)
+
+            for sight in sightings:
+                drone_pos = sight["drone_pos"]
+                dir = sight["dir"]
+
+                if dir == "TL":
+                    # Top-left blip: fish is to top-left of drone
+                    p1x = min(p1x, drone_pos.x)
+                    p1y = min(p1y, drone_pos.y)
+                elif dir == "TR":
+                    # Top-right blip: fish is to top-right of drone
+                    p0x = max(p0x, drone_pos.x)
+                    p1y = min(p1y, drone_pos.y)
+                elif dir == "BL":
+                    # Bottom-left blip: fish is to bottom-left of drone
+                    p1x = min(p1x, drone_pos.x)
+                    p0y = max(p0y, drone_pos.y)
+                elif dir == "BR":
+                    # Bottom-right blip: fish is to bottom-right of drone
+                    p0x = max(p0x, drone_pos.x)
+                    p0y = max(p0y, drone_pos.y)
+
+            # Update bounding box
+            self.fish_entries[fish_id]["bounding_box"]["p0"] = (p0x, p0y)
+            self.fish_entries[fish_id]["bounding_box"]["p1"] = (p1x, p1y)
+
+        first_fish = [fish_id for fish_id in self.fish_entries][0]
+        eprint(first_fish, self.fish_entries[first_fish]["bounding_box"])
+        # eprint(first_fish, comb_radar_blips[first_fish])
+
+
 class DroneAI:
     def __init__(self, drone_id, pos, dead, battery, fish_count, banned_faish_ids):
         self.drone_id = drone_id
@@ -324,6 +400,8 @@ for _ in range(fish_count):
         monster_fish_ids.append(fish_id)
 print(monster_fish_ids, file=sys.stderr)
 
+palantir = Palantir(fish_details, monster_fish_ids)
+
 # game loop
 drone_ais = []
 while True:
@@ -394,6 +472,8 @@ while True:
         drone_id = int(drone_id)
         fish_id = int(fish_id)
         my_radar_blips[drone_id].append(RadarBlip(fish_id, dir))
+
+    palantir.update(visible_fish, my_radar_blips, my_drones, foe_drones)
 
     for drone in drone_ais:
         drone.do_action(visible_fish, my_radar_blips[drone.drone_id])
