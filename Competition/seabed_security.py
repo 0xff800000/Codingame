@@ -65,6 +65,18 @@ class Palantir:
                 "bounding_box": {"p0": (0, 0), "p1": (9999, 9999)},
             }
 
+    def get_fish_min_max_y(self, fish_id):
+        fish_type = self.fish_entries[fish_id]["details"].type
+        if fish_type == -1:
+            return (2500, 10000)
+        elif fish_type == 0:
+            return (2500, 5000)
+        elif fish_type == 1:
+            return (5000, 7500)
+        elif fish_type == 2:
+            return (7500, 10000)
+        return (0, 9999)
+
     def update(self, visible_fish, radar_blips, my_drones, foe_drones):
         self.visible_fish = visible_fish
         self.radar_blips = radar_blips
@@ -94,8 +106,9 @@ class Palantir:
 
         # Update bounding boxes based on combined radar blips
         for fish_id, sightings in comb_radar_blips.items():
-            p0x, p0y = (0, 0)
-            p1x, p1y = (9999, 9999)
+            min_y, max_y = self.get_fish_min_max_y(fish_id)
+            p0x, p0y = (0, min_y)
+            p1x, p1y = (9999, max_y)
 
             for sight in sightings:
                 drone_pos = sight["drone_pos"]
