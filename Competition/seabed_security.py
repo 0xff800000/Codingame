@@ -57,6 +57,10 @@ class Palantir:
         self.radar_blips = []
         self.my_drones = []
         self.foe_drones = []
+        self.all_drone_scans = []
+        self.my_confirmed_scans = []
+        self.foe_confirmed_scans = []
+        self.escaped_fish_ids = set([])
         self.monster_fish_ids = monster_fish_ids
         self.fish_entries = {}
         for fish_id in fish_details:
@@ -77,11 +81,25 @@ class Palantir:
             return (7500, 10000)
         return (0, 9999)
 
-    def update(self, visible_fish, radar_blips, my_drones, foe_drones):
+    def update(
+        self,
+        visible_fish,
+        radar_blips,
+        my_drones,
+        foe_drones,
+        all_drone_scans,
+        my_confirmed_scans,
+        foe_confirmed_scans,
+    ):
         self.visible_fish = visible_fish
         self.radar_blips = radar_blips
         self.my_drones = my_drones
         self.foe_drones = foe_drones
+        self.all_drone_scans = all_drone_scans
+        self.my_confirmed_scans = my_confirmed_scans
+        self.foe_confirmed_scans = foe_confirmed_scans
+
+        ## TODO reset not visible
 
         # Update exact location accordinig to visible data
         for fish in visible_fish:
@@ -135,9 +153,103 @@ class Palantir:
             self.fish_entries[fish_id]["bounding_box"]["p0"] = (p0x, p0y)
             self.fish_entries[fish_id]["bounding_box"]["p1"] = (p1x, p1y)
 
-        first_fish = [fish_id for fish_id in self.fish_entries][0]
-        eprint(first_fish, self.fish_entries[first_fish]["bounding_box"])
+        # Update escaped fishes
+        for fish_id in self.fish_entries:
+            if fish_id not in comb_radar_blips:
+                self.escaped_fish_ids.add(fish_id)
+
+        # first_fish = [fish_id for fish_id in self.fish_entries][0]
+        # eprint(first_fish, self.fish_entries[first_fish]["bounding_box"])
         # eprint(first_fish, comb_radar_blips[first_fish])
+
+    def is_valid_target_fish_id(self, drone_id, fish_id):
+        if (
+            fish_id in self.my_confirmed_scans
+            or fish_id in self.escaped_fish_ids
+            or fish_id in self.monster_fish_ids
+            or (
+                drone_id in self.all_drone_scans
+                and fish_id in self.all_drone_scans[drone_id]
+            )
+        ):
+            return False
+        return True
+
+    def select_target(self, drone_id):
+        potential_targets = [
+            fish_id
+            for fish_id in self.fish_entries
+            if self.is_valid_target_fish_id(drone_id, fish_id)
+        ]
+        # eprint(potential_targets)
+        drone = None
+        for d in self.my_drones:
+            if d.drone_id == drone_id:
+                drone = d
+        if drone is None or len(potential_targets) == 0:
+            return None, None
+
+        direction = np.array([0, 0])
+        target_dir = {fish_id: np.array([0, 0]) for fish_id in potential_targets}
+
+        # Compute target score
+        target_score = {}
+        for fish_id in potential_targets:
+            # Distance visible
+            distance_vis_score = 0
+            if fish_id in [fish.fish_id for fish in self.visible_fish]:
+                rel_x = (
+                    self.fish_entries[fish_id]["exact_location"]["pos"].x - drone.pos.x
+                )
+                rel_y = (
+                    self.fish_entries[fish_id]["exact_location"]["pos"].y - drone.pos.y
+                )
+                distance = math.hypot(rel_x, rel_y)
+                distance_vis_score = 1.0 * (1 - distance / LIGHT_RADIUS)
+
+                target_dir[fish_id] = np.array(
+                    [
+                        self.fish_entries[fish_id]["exact_location"]["pos"].x,
+                        self.fish_entries[fish_id]["exact_location"]["pos"].y,
+                    ]
+                )
+
+            # Bounding box size
+            bbox_size_score = 0
+            p0x, p0y = self.fish_entries[fish_id]["bounding_box"]["p0"]
+            p1x, p1y = self.fish_entries[fish_id]["bounding_box"]["p1"]
+            bbox_surface = (p1x - p0x) * (p1y - p0y)
+            bbox_size_score = 1.0 * (1 - bbox_surface / (10e4**2))
+
+            # Bounding box distance
+            bbox_distance_score = 0
+            center_bbox_x = p0x + (p1x - p0x) / 2
+            center_bbox_y = p0y + (p1y - p0y) / 2
+            bbox_dist = math.hypot(
+                center_bbox_x - drone.pos.x,
+                center_bbox_y - drone.pos.y,
+            )
+            bbox_distance_score = 1.0 * (1 - bbox_dist / 9999)
+
+            if np.linalg.norm(target_dir[fish_id]) == 0:
+                target_dir[fish_id] = np.array(
+                    [
+                        center_bbox_x,
+                        center_bbox_y,
+                    ]
+                )
+
+            # Risk
+            risk_score = 0
+
+            target_score[fish_id] = sum(
+                [distance_vis_score, bbox_size_score, bbox_distance_score, risk_score]
+            )
+
+        # eprint(target_score)
+        best_target = max(target_score, key=target_score.get)
+        eprint(best_target)
+        return best_target, target_dir[best_target]
 
 
 class DroneAI:
@@ -155,7 +267,7 @@ class DroneAI:
         self.stash_size = 4  # Amount of scanned fish before surfacing
         self.monster_ids_to_avoid = {}
         self.monster_avoid_tics = 3
-        self.min_avoid_dist = 1000
+        self.min_avoid_dist = 3000
         self.last_state = None
 
     def update(self, pos, dead, battery, confirmed_scans):
@@ -263,7 +375,7 @@ class DroneAI:
 
         return np.array([dx, dy])
 
-    def do_action(self, visible_fish, radar_blips):
+    def do_action(self, visible_fish, radar_blips, palantir):
         light = self.get_light_action()
         target_x = self.pos[0]
         target_y = 0
@@ -285,7 +397,6 @@ class DroneAI:
         closest_monster = None
         if monsters:
             closest_monster = min(monsters, key=lambda m: self.fish_distance(m))
-            eprint(closest_monster)
             if self.fish_distance(closest_monster) < self.min_avoid_dist:
                 self.state = "avoid_monster"
 
@@ -302,8 +413,8 @@ class DroneAI:
         elif self.state == "avoid_monster":
             if (
                 len(self.monster_ids_to_avoid) == 0
-                and closest_monster is not None
-                and self.fish_distance(closest_monster) > self.min_avoid_dist
+                # and (closest_monster is not None
+                # and self.fish_distance(closest_monster) > self.min_avoid_dist)
             ):
                 self.state = "search_fish"
 
@@ -313,54 +424,59 @@ class DroneAI:
             target_y = 0
 
         elif self.state == "search_fish":
+            fish_id, direction = palantir.select_target(self.drone_id)
+            if fish_id is not None:
+                target_x = round(direction[0])
+                target_y = round(direction[1])
+            eprint(fish_id, target_x, target_y, self.drone_id)
+
             # Target closest visible fish
-            target_fish = self.get_closest_visible_fish(visible_fish)
+            # target_fish = self.get_closest_visible_fish(visible_fish)
 
-            if target_fish is not None:
-                target_x = target_fish.pos.x
-                target_y = target_fish.pos.y
-                dbg_str += f" {target_fish.fish_id}"
-            else:
-                if self.radar_blip_target is not None and (
-                    self.radar_blip_target.fish_id in self.scans
-                    or self.radar_blip_target.fish_id in self.confirmed_scans
-                    or self.radar_blip_target.fish_id in self.banned_fish_ids
-                    or self.radar_blip_target.fish_id not in radar_blip_ids
-                    # or self.radar_is_blip_towards_monster(self.radar_blip_target,radar_blips)
-                ):
-                    self.radar_blip_target = None
+            # if target_fish is not None:
+            #    target_x = target_fish.pos.x
+            #    target_y = target_fish.pos.y
+            #    dbg_str += f" {target_fish.fish_id}"
+            # else:
+            #    if self.radar_blip_target is not None and (
+            #        self.radar_blip_target.fish_id in self.scans
+            #        or self.radar_blip_target.fish_id in self.confirmed_scans
+            #        or self.radar_blip_target.fish_id in self.banned_fish_ids
+            #        or self.radar_blip_target.fish_id not in radar_blip_ids
+            #        # or self.radar_is_blip_towards_monster(self.radar_blip_target,radar_blips)
+            #    ):
+            #        self.radar_blip_target = None
 
-                if self.radar_blip_target is None:
-                    # Pick new unexplored radar blip
-                    potential_radar_blips = [
-                        rb
-                        for rb in radar_blips
-                        if rb.fish_id not in self.confirmed_scans
-                        and rb.fish_id not in self.banned_fish_ids
-                        and rb.fish_id not in self.scans
-                    ]
-                    random.shuffle(potential_radar_blips)
-                    if len(potential_radar_blips) > 0:
-                        self.radar_blip_target = potential_radar_blips[0]
-                else:
-                    # Update blip
-                    for rb in radar_blips:
-                        if rb.fish_id == self.radar_blip_target.fish_id:
-                            self.radar_blip_target = rb
-                            break
+            #    if self.radar_blip_target is None:
+            #        # Pick new unexplored radar blip
+            #        potential_radar_blips = [
+            #            rb
+            #            for rb in radar_blips
+            #            if rb.fish_id not in self.confirmed_scans
+            #            and rb.fish_id not in self.banned_fish_ids
+            #            and rb.fish_id not in self.scans
+            #        ]
+            #        random.shuffle(potential_radar_blips)
+            #        if len(potential_radar_blips) > 0:
+            #            self.radar_blip_target = potential_radar_blips[0]
+            #    else:
+            #        # Update blip
+            #        for rb in radar_blips:
+            #            if rb.fish_id == self.radar_blip_target.fish_id:
+            #                self.radar_blip_target = rb
+            #                break
 
-                if self.radar_blip_target is not None:
-                    dx, dy = DIR_MAPPING[self.radar_blip_target.dir]
-                    target_x = round(self.pos.x + 1000 * dx)
-                    target_y = round(self.pos.y + 1000 * dy)
-                    dbg_str += f"{self.radar_blip_target.fish_id}"
-                else:
-                    dbg_str += " ERROR"
+            #    if self.radar_blip_target is not None:
+            #        dx, dy = DIR_MAPPING[self.radar_blip_target.dir]
+            #        target_x = round(self.pos.x + 1000 * dx)
+            #        target_y = round(self.pos.y + 1000 * dy)
+            #        dbg_str += f"{self.radar_blip_target.fish_id}"
+            #    else:
+            #        dbg_str += " ERROR"
 
         elif self.state == "avoid_monster":
             # Visible monsters
             monster_vec = [self.get_monster_avoid_move(m) for m in monsters]
-            eprint(monster_vec)
             dx, dy = (0, 0)
             for mv in monster_vec:
                 dx += mv[0] / len(monster_vec)
@@ -463,14 +579,17 @@ while True:
         foe_drones.append(drone)
 
     my_drone_ids = [d.drone_id for d in my_drones]
+    all_drone_scans = {d.drone_id: [] for d in my_drones + foe_drones}
 
     drone_scan_count = int(input())
     for _ in range(drone_scan_count):
         drone_id, fish_id = map(int, input().split())
+        all_drone_scans[drone_id].append(fish_id)
         drone_by_id[drone_id].scans.append(fish_id)
         if drone_id in my_drone_ids:
             for d in drone_ais:
                 d.append_scans(drone_id, fish_id)
+    # eprint(all_drone_scans)
 
     visible_fish_count = int(input())
     for _ in range(visible_fish_count):
@@ -486,7 +605,16 @@ while True:
         fish_id = int(fish_id)
         my_radar_blips[drone_id].append(RadarBlip(fish_id, dir))
 
-    palantir.update(visible_fish, my_radar_blips, my_drones, foe_drones)
+    palantir.update(
+        visible_fish,
+        my_radar_blips,
+        my_drones,
+        foe_drones,
+        all_drone_scans,
+        my_scans,
+        foe_scans,
+    )
 
     for drone in drone_ais:
-        drone.do_action(visible_fish, my_radar_blips[drone.drone_id])
+        drone.do_action(visible_fish, my_radar_blips[drone.drone_id], palantir)
+        palantir.select_target(drone.drone_id)
