@@ -251,6 +251,49 @@ class Palantir:
         eprint(best_target)
         return best_target, target_dir[best_target]
 
+    def get_monsters_to_avoid(self, drone_id, danger_radius=3000):
+        """
+        Returns a list of (monster_id, avoid_vector) for monsters within danger_radius
+        """
+        drone = next((d for d in self.my_drones if d.drone_id == drone_id), None)
+        if drone is None:
+            return []
+
+        monsters_to_avoid = []
+
+        # 1. Visible monsters
+        for f in self.visible_fish:
+            if f.fish_id in self.monster_fish_ids:
+                rel_x = drone.pos.x - f.pos.x
+                rel_y = drone.pos.y - f.pos.y
+                dist = math.hypot(rel_x, rel_y)
+
+                if dist < danger_radius:
+                    # Normalize vector away from monster
+                    dx, dy = (rel_x / dist, rel_y / dist) if dist > 0 else (0, 0)
+                    monsters_to_avoid.append((f.fish_id, np.array([dx, dy], dtype=np.float64)))
+
+        # 2. Bounding box monsters (not visible but constrained by radar)
+        for fish_id in self.monster_fish_ids:
+            if (
+                fish_id in self.fish_entries
+                and "exact_location" not in self.fish_entries[fish_id]
+            ):
+                # Use bbox center as an approximate location
+                p0x, p0y = self.fish_entries[fish_id]["bounding_box"]["p0"]
+                p1x, p1y = self.fish_entries[fish_id]["bounding_box"]["p1"]
+                cx, cy = (p0x + p1x) / 2, (p0y + p1y) / 2
+
+                rel_x = drone.pos.x - cx
+                rel_y = drone.pos.y - cy
+                dist = math.hypot(rel_x, rel_y)
+
+                if dist < danger_radius:
+                    dx, dy = (rel_x / dist, rel_y / dist) if dist > 0 else (0, 0)
+                    monsters_to_avoid.append((fish_id, np.array([dx, dy], dtype=np.float64)))
+
+        return monsters_to_avoid
+
 
 class DroneAI:
     def __init__(self, drone_id, pos, dead, battery, fish_count, banned_faish_ids):
@@ -392,13 +435,19 @@ class DroneAI:
             print("WAIT 0")
             return
 
-        # detect monsters
-        monsters = [f for f in visible_fish if f.detail.type == -1]
-        closest_monster = None
+        monsters = palantir.get_monsters_to_avoid(self.drone_id)
         if monsters:
-            closest_monster = min(monsters, key=lambda m: self.fish_distance(m))
-            if self.fish_distance(closest_monster) < self.min_avoid_dist:
-                self.state = "avoid_monster"
+            self.state = "avoid_monster"
+        if self.state == "avoid_monster" and len(monsters) == 0:
+            self.state = "search_fish"
+
+        # detect monsters
+        # monsters = [f for f in visible_fish if f.detail.type == -1]
+        # closest_monster = None
+        # if monsters:
+        #    closest_monster = min(monsters, key=lambda m: self.fish_distance(m))
+        #    if self.fish_distance(closest_monster) < self.min_avoid_dist:
+        #        self.state = "avoid_monster"
 
         # State transition
         if self.state == "search_fish":
@@ -410,13 +459,13 @@ class DroneAI:
         elif self.state == "surface":
             if self.pos.y == 0:
                 self.state = "search_fish"
-        elif self.state == "avoid_monster":
-            if (
-                len(self.monster_ids_to_avoid) == 0
-                # and (closest_monster is not None
-                # and self.fish_distance(closest_monster) > self.min_avoid_dist)
-            ):
-                self.state = "search_fish"
+        # elif self.state == "avoid_monster":
+        #    if (
+        #        len(self.monster_ids_to_avoid) == 0
+        #        # and (closest_monster is not None
+        #        # and self.fish_distance(closest_monster) > self.min_avoid_dist)
+        #    ):
+        #        self.state = "search_fish"
 
         if self.state == "surface":
             light = 0
@@ -475,35 +524,42 @@ class DroneAI:
             #        dbg_str += " ERROR"
 
         elif self.state == "avoid_monster":
-            # Visible monsters
-            monster_vec = [self.get_monster_avoid_move(m) for m in monsters]
-            dx, dy = (0, 0)
-            for mv in monster_vec:
-                dx += mv[0] / len(monster_vec)
-                dy += mv[1] / len(monster_vec)
+            move_dir = np.array([0, 0], dtype=np.float64)
+            for monster_id, avoid_vec in monsters:
+                move_dir += avoid_vec
+            move_dir /= np.linalg.norm(move_dir)
+            target_x = round(drone.pos.x + 1000 * move_dir[0])
+            target_y = round(drone.pos.y + 1000 * move_dir[1])
+            dbg_str += f"{monsters}"
+            ## Visible monsters
+            # monster_vec = [self.get_monster_avoid_move(m) for m in monsters]
+            # dx, dy = (0, 0)
+            # for mv in monster_vec:
+            #    dx += mv[0] / len(monster_vec)
+            #    dy += mv[1] / len(monster_vec)
 
-            # Radar monster
-            for m in monsters:
-                self.monster_ids_to_avoid[m.fish_id] = self.monster_avoid_tics
+            ## Radar monster
+            # for m in monsters:
+            #    self.monster_ids_to_avoid[m.fish_id] = self.monster_avoid_tics
 
-            for m_id in self.monster_ids_to_avoid:
-                for rb in radar_blips:
-                    if rb.fish_id == m_id:
-                        _dx, _dy = DIR_MAPPING[rb.dir]
-                        dx -= _dx / len(self.monster_ids_to_avoid)
-                        dy -= _dy / len(self.monster_ids_to_avoid)
+            # for m_id in self.monster_ids_to_avoid:
+            #    for rb in radar_blips:
+            #        if rb.fish_id == m_id:
+            #            _dx, _dy = DIR_MAPPING[rb.dir]
+            #            dx -= _dx / len(self.monster_ids_to_avoid)
+            #            dy -= _dy / len(self.monster_ids_to_avoid)
 
-            rem_id = [
-                m_id
-                for m_id in self.monster_ids_to_avoid
-                if self.monster_ids_to_avoid[m_id] <= 0
-            ]
-            for m_id in rem_id:
-                del self.monster_ids_to_avoid[m_id]
-            dbg_str += str(self.monster_ids_to_avoid)
+            # rem_id = [
+            #    m_id
+            #    for m_id in self.monster_ids_to_avoid
+            #    if self.monster_ids_to_avoid[m_id] <= 0
+            # ]
+            # for m_id in rem_id:
+            #    del self.monster_ids_to_avoid[m_id]
+            # dbg_str += str(self.monster_ids_to_avoid)
 
-            target_x = round(self.pos.x + 1000 * dx)
-            target_y = round(self.pos.y + 1000 * dy)
+            # target_x = round(self.pos.x + 1000 * dx)
+            # target_y = round(self.pos.y + 1000 * dy)
 
         target_x = max(min(round(target_x), 9999), 0)
         target_y = max(min(round(target_y), 9999), 0)
@@ -618,3 +674,4 @@ while True:
     for drone in drone_ais:
         drone.do_action(visible_fish, my_radar_blips[drone.drone_id], palantir)
         palantir.select_target(drone.drone_id)
+        # eprint(palantir.get_monsters_to_avoid(drone.drone_id))
