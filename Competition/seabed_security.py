@@ -81,6 +81,12 @@ class Palantir:
             return (7500, 10000)
         return (0, 9999)
 
+    def get_fish_max_speed(self, fish_id):
+        fish_type = self.fish_entries[fish_id]["details"].type
+        if fish_type == -1:
+            return 540
+        return 400
+
     def update(
         self,
         visible_fish,
@@ -125,8 +131,21 @@ class Palantir:
         # Update bounding boxes based on combined radar blips
         for fish_id, sightings in comb_radar_blips.items():
             min_y, max_y = self.get_fish_min_max_y(fish_id)
-            p0x, p0y = (0, min_y)
-            p1x, p1y = (9999, max_y)
+
+            # Get last bbox
+            bbox = self.fish_entries[fish_id]["bounding_box"]
+            p0x, p0y = bbox["p0"]
+            p1x, p1y = bbox["p1"]
+
+            # Inflate box according to max speed
+            speed = self.get_fish_max_speed(fish_id)
+            p0x -= speed
+            p0y -= speed
+            p1x += speed
+            p1y += speed
+
+            p0x, p0y = (max(0, p0x), max(min_y, p0y))
+            p1x, p1y = (min(9999, p1x), min(max_y, p1y))
 
             for sight in sightings:
                 drone_pos = sight["drone_pos"]
